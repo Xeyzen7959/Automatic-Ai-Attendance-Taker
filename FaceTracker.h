@@ -5,6 +5,12 @@
 #include <opencv2/face.hpp>
 #include <vector>
 #include <string>
+#include <map>
+
+struct Student {
+    std::string name;
+    std::string nim;
+};
 
 class FaceTracker {
 public:
@@ -23,6 +29,12 @@ private:
     const int totalSamplesNeeded = 30;
     std::string lastRecognized;
     bool registrationRequested;
+
+    // Database management
+    std::map<int, Student> studentDatabase;
+    int currentRegisteringId;
+    void loadDatabase();
+    void saveToDatabase(int id, const std::string& name, const std::string& nim);
 };
 
 #endif
