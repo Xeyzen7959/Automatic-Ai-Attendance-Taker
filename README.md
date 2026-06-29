@@ -10,7 +10,7 @@
 ---
 
 ## 📝 Product Description
-An AI-powered automated attendance system that replaces manual logbooks with real-time biometric verification. Running a high-speed **Face Detection and Recognition pipeline** (Haar Cascades + LBPH), the system identifies registered individuals via a webcam and instantly transmits authorization payloads to an Arduino hardware layer to manage localized access or displays.
+An AI-powered automated attendance system that replaces manual logbooks with real-time biometric verification. Running a high-speed **Face Detection and Recognition pipeline** (Haar Cascades + LBPH), the system identifies registered individuals via a webcam, maps them to a local CSV student profile database, and instantly transmits authorization payloads to an Arduino hardware layer.
 
 ---
 
@@ -32,8 +32,9 @@ AttendanceProject/
 ├── 📄 SerialComm.h        # Serial interface definitions
 ├── 📄 SerialComm.cpp      # Cross-platform serial drivers (Windows/macOS)
 ├── 📄 FaceTracker.h       # LBPH Tracking engine definitions
-├── 📄 FaceTracker.cpp     # Detection, registration, and training logic
+├── 📄 FaceTracker.cpp     # Detection, registration, and CSV mapping database logic
 ├── 📄 main.cpp            # Application lifecycle entryway
+├── 📄 students.csv        # Local student name and NIM metadata registry
 └── ⚙️ haarcascade_frontalface_default.xml
 ```
 
@@ -53,7 +54,7 @@ void sendToArduino(const std::string& portName, const std::string& data);
 #endif
 ```
 
-### 2. `SerialComm.cpp` *(Cross-Platform: Windows & macOS)*
+### 2. `SerialComm.cpp`
 ```cpp
 #include "SerialComm.h"
 #ifdef _WIN32
@@ -109,6 +110,12 @@ void sendToArduino(const std::string& portName, const std::string& data) {
 #include <opencv2/face.hpp>
 #include <vector>
 #include <string>
+#include <map>
+
+struct Student {
+    std::string name;
+    std::string nim;
+};
 
 class FaceTracker {
 public:
@@ -127,6 +134,12 @@ private:
     const int totalSamplesNeeded = 30;
     std::string lastRecognized;
     bool registrationRequested;
+
+    // Database management
+    std::map<int, Student> studentDatabase;
+    int currentRegisteringId;
+    void loadDatabase();
+    void saveToDatabase(int id, const std::string& name, const std::string& nim);
 };
 
 #endif
@@ -137,17 +150,49 @@ private:
 #include "FaceTracker.h"
 #include "SerialComm.h"
 #include <iostream>
+#include <fstream>
+#include <sstream>
 
 using namespace cv;
 using namespace cv::face;
 using namespace std;
 
-FaceTracker::FaceTracker() : isTrained(false), sampleCount(0), lastRecognized(""), registrationRequested(false) {
+FaceTracker::FaceTracker() : isTrained(false), sampleCount(0), lastRecognized(""), registrationRequested(false), currentRegisteringId(1) {
     recognizer = LBPHFaceRecognizer::create();
+}
+
+void FaceTracker::loadDatabase() {
+    studentDatabase.clear();
+    ifstream file("students.csv");
+    if (!file.is_open()) return;
+
+    string line;
+    int maxId = 0;
+    while (getline(file, line)) {
+        stringstream ss(line);
+        string idStr, name, nim;
+        if (getline(ss, idStr, ',') && getline(ss, name, ',') && getline(ss, nim, ',')) {
+            int id = stoi(idStr);
+            studentDatabase[id] = {name, nim};
+            if (id > maxId) maxId = id;
+        }
+    }
+    file.close();
+    currentRegisteringId = maxId + 1;
+}
+
+void FaceTracker::saveToDatabase(int id, const string& name, const string& nim) {
+    ofstream file("students.csv", ios::app);
+    if (file.is_open()) {
+        file << id << "," << name << "," << nim << "\n";
+        file.close();
+    }
+    studentDatabase[id] = {name, nim};
 }
 
 bool FaceTracker::init(const string& cascadePath) {
     if (!face_cascade.load(cascadePath)) return false;
+    loadDatabase();
     try {
         recognizer->read("trained_model.yml");
         isTrained = true;
@@ -158,13 +203,20 @@ bool FaceTracker::init(const string& cascadePath) {
 }
 
 void FaceTracker::startRegistration() {
-    if (!isTrained) {
-        sampleCount = 0;
-        trainingImages.clear();
-        trainingLabels.clear();
-        registrationRequested = true;
-        cout << "Starting registration..." << endl;
-    }
+    string name, nim;
+    cout << "\n=== NEW STUDENT REGISTRATION ===" << endl;
+    cout << "Enter Student Name: ";
+    getline(cin, name);
+    cout << "Enter Student NIM: ";
+    getline(cin, nim);
+
+    sampleCount = 0;
+    trainingImages.clear();
+    trainingLabels.clear();
+    registrationRequested = true;
+    
+    saveToDatabase(currentRegisteringId, name, nim);
+    cout << "Data saved to database. Look at the camera to capture face profile..." << endl;
 }
 
 void FaceTracker::process(Mat& frame, char key, const string& arduinoPort) {
@@ -175,7 +227,10 @@ void FaceTracker::process(Mat& frame, char key, const string& arduinoPort) {
     vector<Rect> faces;
     face_cascade.detectMultiScale(gray, faces, 1.1, 4, 0, Size(100, 100));
 
-    if (key == 'r' || key == 'R') startRegistration();
+    if (key == 'r' || key == 'R') {
+        startRegistration();
+        return; 
+    }
 
     for (size_t i = 0; i < faces.size(); i++) {
         Mat faceROI = gray(faces[i]);
@@ -184,30 +239,39 @@ void FaceTracker::process(Mat& frame, char key, const string& arduinoPort) {
         string displayText = "Scanning...";
         Scalar color = Scalar(255, 255, 0);
 
-        if (!isTrained && registrationRequested && sampleCount < totalSamplesNeeded) {
+        if (registrationRequested && sampleCount < totalSamplesNeeded) {
             trainingImages.push_back(faceROI.clone());
-            trainingLabels.push_back(1);
+            trainingLabels.push_back(currentRegisteringId);
             sampleCount++;
             
             displayText = "Registering: " + to_string(sampleCount) + "/" + to_string(totalSamplesNeeded);
             color = Scalar(0, 165, 255);
 
             if (sampleCount == totalSamplesNeeded) {
-                recognizer->train(trainingImages, trainingLabels);
+                try {
+                    recognizer->read("trained_model.yml");
+                    recognizer->update(trainingImages, trainingLabels);
+                } catch(...) {
+                    recognizer->train(trainingImages, trainingLabels);
+                }
+                
                 recognizer->save("trained_model.yml");
                 isTrained = true;
                 registrationRequested = false;
-                cout << "Face saved!" << endl;
+                cout << "Face profile trained and locked successfully for ID: " << currentRegisteringId << "!\n" << endl;
+                currentRegisteringId++; 
             }
         } 
-        else if (isTrained) {
+        else if (isTrained && !registrationRequested) {
             int label = -1;
             double confidence = 0.0;
             recognizer->predict(faceROI, label, confidence);
 
-            if (label == 1 && confidence < 70.0) {
-                displayText = "User " + to_string(label) + " - Present";
+            if (studentDatabase.find(label) != studentDatabase.end() && confidence < 70.0) {
+                Student s = studentDatabase[label];
+                displayText = s.name + " (" + s.nim + ") - Present";
                 color = Scalar(0, 255, 0);
+                
                 if (lastRecognized != displayText) {
                     sendToArduino(arduinoPort, "1\n");
                     lastRecognized = displayText;
@@ -215,6 +279,7 @@ void FaceTracker::process(Mat& frame, char key, const string& arduinoPort) {
             } else {
                 displayText = "Unknown Face";
                 color = Scalar(0, 0, 255);
+                
                 if (lastRecognized != displayText) {
                     sendToArduino(arduinoPort, "0\n");
                     lastRecognized = displayText;
@@ -223,7 +288,7 @@ void FaceTracker::process(Mat& frame, char key, const string& arduinoPort) {
         }
 
         rectangle(frame, faces[i], color, 2);
-        putText(frame, displayText, Point(faces[i].x, faces[i].y - 10), FONT_HERSHEY_SIMPLEX, 0.8, color, 2);
+        putText(frame, displayText, Point(faces[i].x, faces[i].y - 10), FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
     }
 }
 ```
@@ -249,11 +314,10 @@ int main() {
         return -1;
     }
 
-    // Set hardware COM port here (e.g., "\\\\.\\COM3" for Windows or "/dev/cu.usbmodem101" for Mac)
     string arduinoPort = "/dev/cu.usbmodem101"; 
     Mat frame;
 
-    cout << "Press 'R' to start face registration. Press 'ESC' to exit." << endl;
+    cout << "Press 'R' in the graphics window to register a new student profile. Press 'ESC' to close application." << endl;
 
     while (true) {
         cap >> frame;
@@ -277,88 +341,36 @@ int main() {
 ## 💻 OS-Specific Prerequisites & Compilation
 
 ### 🍏 For macOS Users
-
-#### 1. System Setup
-Install OpenCV and compiler utilities via Homebrew:
 ```bash
 brew install opencv pkg-config
-```
-
-#### 2. Hardware Configuration
-Open `main.cpp` and set the connection string to match your Mac serial address:
-```cpp
-string arduinoPort = "/dev/cu.usbmodem101"; // Check your Arduino IDE Port menu
-```
-
-#### 3. Compilation & Execution
-```bash
-g++ -std=c++11 main.cpp SerialComm.cpp FaceTracker.cpp -o attendance `pkg-config --cflags --libs opencv4`
+g++ -std=c++11 *.cpp -o attendance `pkg-config --cflags --libs opencv4`
 ./attendance
 ```
 
----
-
 ### 🪟 For Windows Users
-
-#### 1. System Setup
-1. Download and extract **OpenCV for Windows** to `C:\opencv`.
-2. Add `C:\opencv\build\x64\vc16\bin` to your system Environment **Path**.
-3. Ensure a C++ compiler like MinGW (via MSYS2) is installed and added to environment variables.
-
-#### 2. Hardware Configuration
-Open `main.cpp` and change the string to follow the Win32 format:
-```cpp
-string arduinoPort = "\\\\.\\COM3"; // Match your actual Arduino COM port
-```
-
-#### 3. Compilation & Execution
 ```bash
-g++ -std=c++11 main.cpp SerialComm.cpp FaceTracker.cpp -o attendance.exe -I"C:\opencv\build\include" -L"C:\opencv\build\x64\vc16\lib" -lopencv_world4xx
+g++ -std=c++11 *.cpp -o attendance.exe -I"C:\opencv\build\include" -L"C:\opencv\build\x64\vc16\lib" -lopencv_world4xx
 .\attendance.exe
 ```
-*(Note: Replace `4xx` with your exact OpenCV release version number, e.g., `460` or `4100`)*
 
 ---
 
 ## 🚀 Step-by-Step Operational Tutorial
 
 ### 1️⃣ Step 1: System Boot & Initialization
-* Run the executable via your terminal (`./attendance` or `.\attendance.exe`).
-* The system checks your directory for an existing model database (`trained_model.yml`).
-* If no model is found, the console prints: `No model found. Register face first.`
-* The webcam interface initializes immediately, showing a live video feed labeled **"Facial Recognition Attendance Simulation"**.
+* Run the executable. The program initializes the webcam and automatically loads `students.csv` mapping registries along with the trained weight architecture file (`trained_model.yml`).
 
-### 2️⃣ Step 2: Biometric Enrollment (Phase 2)
-```text
-State: UNREGISTERED 🟡
-Visual Cue: Yellow Bounding Box Around Detected Face
-Text Overlay: "Scanning..."
-```
-* Step directly into the center frame of the camera.
-* Press the **`R`** key on your keyboard to trigger the automatic data acquisition engine.
-* **Action Required:** Keep looking at the lens while slightly tilting/shifting your head to capture multiple angles.
-* The UI overlay will instantly change to an active progress tracker showing: `Registering: X/30` as it collects 30 unique, normalized matrix profiles of your face.
+### 2️⃣ Step 2: Biometric & Metadata Enrollment
+* Press **`R`** on your keyboard inside the window screen.
+* Move to the terminal window and input the student's **Name** and **NIM** details.
+* Look directly back at the webcam lens to automatically acquire 30 unique structural facial frames.
 
-### 3️⃣ Step 3: Automated Model Training (Phase 3)
-* The moment the sample collection counter hits `30/30`, the scanning phase locks.
-* The system automatically offloads the captured imagery matrices into the **LBPH Face Recognizer** training algorithm.
-* The terminal logs: `Training model...` followed shortly by `Face saved!`.
-* A local binary file named `trained_model.yml` is generated in your project folder. The system is now fully autonomous and retains this memory even if you close the app.
+### 3️⃣ Step 3: Persistence Database Logging
+* The system automatically maps the face profile to the entry inside `students.csv` and compiles the computational nodes into `trained_model.yml`.
 
-### 4️⃣ Step 4: Live Verification & Attendance Logging (Phase 4 & 5)
-The engine automatically flips from enrollment mode into live verification matching:
-
-#### 🟢 Case A: Successful Match (Authorized Presence)
-* **Visual Identity:** When you step into the frame, the bounding box turns bright **Green**.
-* **UI Display:** Text changes to `User 1 - Present`.
-* **Hardware Payload:** The application sends a high data flag (`"1\n"`) through the serial pipeline to the Arduino.
-* **Hardware Response:** The Arduino parses the instruction, lighting up the connected LCD 16x2 block with a personalized message: `Selamat datang User`.
-
-#### 🔴 Case B: Unrecognized Face (Access Denied)
-* **Visual Identity:** If an unknown person steps into the camera track, the bounding box turns sharp **Red**.
-* **UI Display:** Text displays `Unknown Face`.
-* **Hardware Payload:** The application pushes a low data flag (`"0\n"`) through the serial connection.
-* **Hardware Response:** The Arduino denies entry/logging and clears or flags the display appropriately.
+### 4️⃣ Step 4: Verification Loop
+* **Authorized Entry:** Bounding box highlights **Green**, rendering the student's actual **Name** and **NIM** on screen, while dispatching high payload `1` to the serial hardware stack.
+* **Unauthorized Entry:** Bounding box highlights **Red**, displaying `Unknown Face` text flags and dispatching a low authorization signal `0`.
 
 ---
 
@@ -368,19 +380,11 @@ The engine automatically flips from enrollment mode into live verification match
 graph TD
     A[Activate Webcam] --> B[Haar Cascade Detection]
     B --> C{Model Trained?}
-    C -- No --> D[Press 'R' to Capture 30 Dataset Samples]
-    D --> E[Auto-Train & Save trained_model.yml]
+    C -- No --> D[Press 'R' & Input Name/NIM in Terminal]
+    D --> E[Log to students.csv & Train Model]
     E --> F[LBPH Verification Mode]
     C -- Yes --> F
-    F --> G{Confidence < 70?}
-    G -- Match --> H[Send '1' to Serial -> LCD: Welcome User]
-    G -- Mismatch --> I[Send '0' to Serial -> Access Denied]
-```
-
----
-
-## ⌨️ Operation Shortcuts
-
-* **`R` / `r`** — Initiate Face Registration Mode (Gathers 30 frames automatically)
-* **`ESC`** — Terminate processes and close the application safely
+    F --> G{Confidence < 70 & ID Found?}
+    G -- Match --> H[Display Name + NIM -> Send '1' to Arduino]
+    G -- Mismatch --> I[Display Unknown -> Send '0' to Arduino]
 ```
