@@ -1,4 +1,3 @@
-
 #ifndef FACE_TRACKER_H
 #define FACE_TRACKER_H
 
