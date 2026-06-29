@@ -7,7 +7,7 @@ using namespace std;
 int main() {
     VideoCapture cap(0);
     if (!cap.isOpened()) {
-        cerr << "Error: Cannot open Mac webcam." << endl;
+        cerr << "Error: Cannot open webcam." << endl;
         return -1;
     }
 
@@ -20,7 +20,7 @@ int main() {
     string arduinoPort = "/dev/cu.usbmodem101"; 
     Mat frame;
 
-    cout << "Press 'R' to start face registration. Press 'ESC' to exit." << endl;
+    cout << "Press 'R' in the graphics window to register a new student profile. Press 'ESC' to close application." << endl;
 
     while (true) {
         cap >> frame;
